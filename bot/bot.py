@@ -108,6 +108,10 @@ def _skip_hint(step: FieldStep) -> str:
     return "\n\nЕсли не знаешь, нажми Пропустить или отправь /skip."
 
 
+def _restart_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup([["/start"]], resize_keyboard=True, one_time_keyboard=True)
+
+
 async def _ask_current(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     step = _current_step(context)
     await update.message.reply_text(
@@ -244,8 +248,11 @@ async def _next_or_predict(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     result = response.json()
     price = result["predicted_price_rounded"]
     currency = result.get("currency", "KZT")
+    formatted_price = f"{price:,.0f}".replace(",", " ")
     await update.message.reply_text(
-        f"Прогноз цены: {price:,.0f} {currency}".replace(",", " ")
+        f"Прогноз цены: {formatted_price} {currency}\n\n"
+        "Чтобы посчитать еще одну квартиру, нажми /start.",
+        reply_markup=_restart_keyboard(),
     )
     context.user_data.clear()
     return ConversationHandler.END
