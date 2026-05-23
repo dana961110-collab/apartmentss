@@ -166,12 +166,28 @@ async def skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return await _next_or_predict(update, context)
 
 
+async def skip_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    while context.user_data["step_index"] < len(FIELD_STEPS):
+        step = _current_step(context)
+        if step.required:
+            await update.message.reply_text("Сначала нужно ответить на обязательный вопрос.")
+            return await _ask_current(update, context)
+
+        context.user_data["answers"][step.name] = None
+        context.user_data["step_index"] += 1
+
+    return await _next_or_predict(update, context)
+
+
 async def receive_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     step = _current_step(context)
     text = update.message.text or ""
 
     if text.strip().lower() == "пропустить":
         return await skip(update, context)
+
+    if text.strip().lower() in {"пропустить все", "skip all", "skipall"}:
+        return await skip_all(update, context)
 
     try:
         value = _parse_answer(text, step)
@@ -248,6 +264,7 @@ def main() -> None:
         states={
             ASK_FIELD: [
                 CommandHandler("skip", skip),
+                CommandHandler("skipall", skip_all),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_answer),
             ],
         },
