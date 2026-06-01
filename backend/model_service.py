@@ -1,4 +1,5 @@
 from functools import lru_cache
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -8,6 +9,7 @@ import pandas as pd
 from .schemas import ApartmentRequest
 
 
+logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).resolve().parents[1]
 MODEL_PATH = BASE_DIR / "randomforest_log_target.pkl"
 FEATURE_COLUMNS = [
@@ -40,11 +42,42 @@ FEATURE_COLUMNS = [
 ]
 
 
+class ModelLoadError(RuntimeError):
+    pass
+
+
+class ModelPredictionError(RuntimeError):
+    pass
+
+
 @lru_cache(maxsize=1)
 def load_model() -> Any:
     if not MODEL_PATH.exists():
-        raise FileNotFoundError(f"Model file not found: {MODEL_PATH}")
-    return joblib.load(MODEL_PATH)
+        message = f"Model file not found: {MODEL_PATH}"
+        logger.error(message)
+        raise ModelLoadError(message)
+
+    try:
+        model = joblib.load(MODEL_PATH)
+    except Exception as exc:
+        logger.exception("Failed to load model from %s", MODEL_PATH)
+        raise ModelLoadError("Failed to load prediction model") from exc
+
+    expected_features = getattr(model, "feature_names_in_", None)
+    if expected_features is not None and list(expected_features) != FEATURE_COLUMNS:
+        logger.error(
+            "Model feature mismatch. expected=%s actual=%s",
+            list(expected_features),
+            FEATURE_COLUMNS,
+        )
+        raise ModelLoadError("Model feature list does not match API feature list")
+
+    logger.info(
+        "Prediction model loaded from %s with %s features",
+        MODEL_PATH,
+        getattr(model, "n_features_in_", len(FEATURE_COLUMNS)),
+    )
+    return model
 
 
 def _bool_to_int(value: bool | None) -> int | None:
@@ -64,7 +97,7 @@ def build_features(payload: ApartmentRequest) -> pd.DataFrame:
     kitchen_area = data.get("kitchen_area")
     living_area = data.get("living_area")
 
-    data["building_age"] = 2026 - year_built if year_built else None
+    data["building_age"] = payload.current_year - year_built if year_built else None
     data["floor_ratio"] = floor / total_floors if total_floors else None
     data["is_first_floor"] = int(floor == 1)
     data["is_last_floor"] = int(floor == total_floors)
@@ -76,11 +109,25 @@ def build_features(payload: ApartmentRequest) -> pd.DataFrame:
     data["kitchen_area_ratio"] = kitchen_area / area if kitchen_area and area else None
     data["living_area_ratio"] = living_area / area if living_area and area else None
 
-    return pd.DataFrame([{column: data.get(column) for column in FEATURE_COLUMNS}])
+    features = pd.DataFrame([{column: data.get(column) for column in FEATURE_COLUMNS}])
+    logger.info("Built model features: %s", features.to_dict(orient="records")[0])
+    return features
 
 
 def predict_price(payload: ApartmentRequest) -> float:
-    model = load_model()
-    features = build_features(payload)
-    prediction = model.predict(features)[0]
-    return float(prediction)
+    try:
+        model = load_model()
+        features = build_features(payload)
+        prediction = float(model.predict(features)[0])
+    except ModelLoadError:
+        raise
+    except Exception as exc:
+        logger.exception("Model prediction failed for payload=%s", payload.model_dump())
+        raise ModelPredictionError("Prediction failed") from exc
+
+    if prediction <= 0:
+        logger.error("Model returned non-positive prediction: %s", prediction)
+        raise ModelPredictionError("Prediction must be positive")
+
+    logger.info("Model prediction result: %s", prediction)
+    return prediction

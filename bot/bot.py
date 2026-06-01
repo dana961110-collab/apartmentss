@@ -1,4 +1,5 @@
 import os
+import logging
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -18,10 +19,15 @@ from telegram.ext import (
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-API_URL = os.getenv("API_URL", "http://127.0.0.1:8000")
+API_URL = os.getenv("API_URL", "http://127.0.0.1:8000").rstrip("/")
+REQUEST_TIMEOUT_SECONDS = 20
 
 ASK_FIELD = 1
 FieldType = Literal["number", "text", "bool"]
+CLEAR_HISTORY_TEXT = "🗑 Очистить историю"
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -82,7 +88,12 @@ FIELD_STEPS = [
 
 
 def _current_step(context: ContextTypes.DEFAULT_TYPE) -> FieldStep:
-    return FIELD_STEPS[context.user_data["step_index"]]
+    context.user_data.setdefault("answers", {})
+    step_index = context.user_data.get("step_index", 0)
+    if not isinstance(step_index, int) or step_index < 0 or step_index >= len(FIELD_STEPS):
+        step_index = 0
+        context.user_data["step_index"] = step_index
+    return FIELD_STEPS[step_index]
 
 
 def _keyboard_for_step(step: FieldStep) -> ReplyKeyboardMarkup | ReplyKeyboardRemove:
@@ -109,7 +120,16 @@ def _skip_hint(step: FieldStep) -> str:
 
 
 def _restart_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup([["/start"]], resize_keyboard=True, one_time_keyboard=True)
+    return ReplyKeyboardMarkup(
+        [["/start"], [CLEAR_HISTORY_TEXT]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
+def _clear_user_context(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.clear()
+    context.chat_data.clear()
 
 
 async def _ask_current(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -122,6 +142,7 @@ async def _ask_current(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    logger.info("Starting prediction dialog user_id=%s", update.effective_user.id if update.effective_user else None)
     context.user_data.clear()
     context.user_data["answers"] = {}
     context.user_data["step_index"] = 0
@@ -133,10 +154,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.clear()
+    logger.info("Prediction dialog cancelled user_id=%s", update.effective_user.id if update.effective_user else None)
+    _clear_user_context(context)
     await update.message.reply_text(
         "Опрос остановлен. Чтобы начать заново, отправь /start.",
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=_restart_keyboard(),
+    )
+    return ConversationHandler.END
+
+
+async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    logger.info("Clearing dialog history user_id=%s", update.effective_user.id if update.effective_user else None)
+    _clear_user_context(context)
+    await update.message.reply_text(
+        "История успешно очищена.",
+        reply_markup=_restart_keyboard(),
     )
     return ConversationHandler.END
 
@@ -186,6 +218,12 @@ async def skip_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def receive_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     step = _current_step(context)
     text = update.message.text or ""
+    logger.info(
+        "Received answer user_id=%s step=%s raw=%s",
+        update.effective_user.id if update.effective_user else None,
+        step.name,
+        text,
+    )
 
     if text.strip().lower() == "пропустить":
         return await skip(update, context)
@@ -213,49 +251,87 @@ async def _next_or_predict(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         for key, value in context.user_data["answers"].items()
         if value is not None
     }
+    logger.info(
+        "Sending prediction payload user_id=%s payload=%s",
+        update.effective_user.id if update.effective_user else None,
+        payload,
+    )
     await update.message.reply_text("Считаю прогноз...", reply_markup=ReplyKeyboardRemove())
 
     try:
-        response = requests.post(f"{API_URL}/predict", json=payload, timeout=20)
+        response = requests.post(f"{API_URL}/predict", json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+        logger.info("API response status=%s body=%s", response.status_code, response.text)
         response.raise_for_status()
     except requests.HTTPError as exc:
-        details = ""
+        logger.exception("API returned an error for payload=%s", payload)
+        message = "Проверьте введённые данные и попробуйте снова."
         try:
-            api_errors = response.json().get("detail", [])
-            if api_errors:
-                details = "\n\nДетали:\n" + "\n".join(
-                    f"- {'.'.join(map(str, error.get('loc', [])))}: {error.get('msg')}"
-                    for error in api_errors
-                )
-        except ValueError:
-            details = f"\n\nОтвет API: {response.text}"
+            detail = response.json().get("detail")
+            if isinstance(detail, dict) and detail.get("code") == "model_unavailable":
+                message = "Не удалось загрузить модель прогнозирования."
+            elif response.status_code >= 500:
+                message = "Не удалось получить прогноз. Попробуйте позже."
+        except requests.JSONDecodeError:
+            if response.status_code >= 500:
+                message = "Не удалось получить прогноз. Попробуйте позже."
 
         await update.message.reply_text(
-            "API получил данные, но не смог их обработать."
-            f"{details}\n\n"
-            "Попробуй начать заново: /start"
+            message,
+            reply_markup=_restart_keyboard(),
         )
+        context.user_data.clear()
         return ConversationHandler.END
     except requests.RequestException as exc:
+        logger.exception("Prediction API is unavailable")
         await update.message.reply_text(
-            "Не смог получить прогноз от API. "
-            "Проверь, что backend запущен командой:\n"
-            "uvicorn backend.main:app --reload\n\n"
-            f"Ошибка: {exc}"
+            "Не удалось получить прогноз. Попробуйте позже.",
+            reply_markup=_restart_keyboard(),
         )
+        context.user_data.clear()
+        return ConversationHandler.END
+    except Exception:
+        logger.exception("Unexpected Telegram bot error while requesting prediction")
+        await update.message.reply_text(
+            "Не удалось получить прогноз. Попробуйте позже.",
+            reply_markup=_restart_keyboard(),
+        )
+        context.user_data.clear()
         return ConversationHandler.END
 
-    result = response.json()
-    price = result["predicted_price_rounded"]
-    currency = result.get("currency", "KZT")
+    try:
+        result = response.json()
+        price = result["predicted_price_rounded"]
+        currency = result.get("currency", "KZT")
+    except (ValueError, KeyError, TypeError):
+        logger.exception("Invalid API response format: %s", response.text)
+        await update.message.reply_text(
+            "Не удалось получить прогноз. Попробуйте позже.",
+            reply_markup=_restart_keyboard(),
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+
     formatted_price = f"{price:,.0f}".replace(",", " ")
     await update.message.reply_text(
         f"Прогноз цены: {formatted_price} {currency}\n\n"
         "Чтобы посчитать еще одну квартиру, нажми /start.",
         reply_markup=_restart_keyboard(),
     )
+    logger.info("Prediction delivered user_id=%s result=%s", update.effective_user.id if update.effective_user else None, result)
     context.user_data.clear()
     return ConversationHandler.END
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    exc_info = None
+    if context.error:
+        exc_info = (type(context.error), context.error, context.error.__traceback__)
+    logger.error("Unhandled Telegram error update=%s", update, exc_info=exc_info)
+    if isinstance(update, Update) and update.effective_message:
+        await update.effective_message.reply_text(
+            "Не удалось получить прогноз. Попробуйте позже.",
+            reply_markup=_restart_keyboard(),
+        )
 
 
 def main() -> None:
@@ -270,15 +346,26 @@ def main() -> None:
         ],
         states={
             ASK_FIELD: [
+                CommandHandler("start", start),
+                CommandHandler("predict", start),
                 CommandHandler("skip", skip),
                 CommandHandler("skipall", skip_all),
+                MessageHandler(filters.Regex(f"^{CLEAR_HISTORY_TEXT}$"), clear_history),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_answer),
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+            CommandHandler("start", start),
+            CommandHandler("predict", start),
+            CommandHandler("cancel", cancel),
+            MessageHandler(filters.Regex(f"^{CLEAR_HISTORY_TEXT}$"), clear_history),
+        ],
+        allow_reentry=True,
     )
 
     app.add_handler(conversation)
+    app.add_handler(MessageHandler(filters.Regex(f"^{CLEAR_HISTORY_TEXT}$"), clear_history))
+    app.add_error_handler(on_error)
     app.run_polling()
 
 
