@@ -1,7 +1,9 @@
 import os
 import logging
+import traceback
 from dataclasses import dataclass
 from typing import Any, Literal
+from urllib.parse import urljoin
 
 import requests
 from dotenv import load_dotenv
@@ -19,7 +21,7 @@ from telegram.ext import (
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-API_URL = os.getenv("API_URL", "http://127.0.0.1:8000").rstrip("/")
+API_URL = os.getenv("API_URL", "http://127.0.0.1:8000").strip().rstrip("/")
 REQUEST_TIMEOUT_SECONDS = 20
 
 ASK_FIELD = 1
@@ -127,9 +129,43 @@ def _restart_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
+def _predict_url() -> str:
+    return urljoin(f"{API_URL}/", "predict")
+
+
+def _log_exception(message: str, exc: BaseException, **extra: Any) -> None:
+    logger.error(
+        "%s exception=%s traceback=%s extra=%s",
+        message,
+        repr(exc),
+        traceback.format_exc(),
+        extra,
+    )
+
+
+def _log_api_response(response: requests.Response | None) -> None:
+    if response is None:
+        logger.error("API response is missing")
+        return
+
+    logger.info(
+        "API response received url=%s status_code=%s response_text=%s",
+        response.url,
+        response.status_code,
+        response.text,
+    )
+
+
 def _clear_user_context(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.clear()
     context.chat_data.clear()
+
+
+def _drop_persisted_context(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user:
+        context.application.drop_user_data(update.effective_user.id)
+    if update.effective_chat:
+        context.application.drop_chat_data(update.effective_chat.id)
 
 
 async def _ask_current(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -143,7 +179,7 @@ async def _ask_current(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     logger.info("Starting prediction dialog user_id=%s", update.effective_user.id if update.effective_user else None)
-    context.user_data.clear()
+    _clear_user_context(context)
     context.user_data["answers"] = {}
     context.user_data["step_index"] = 0
     await update.message.reply_text(
@@ -166,6 +202,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     logger.info("Clearing dialog history user_id=%s", update.effective_user.id if update.effective_user else None)
     _clear_user_context(context)
+    _drop_persisted_context(update, context)
     await update.message.reply_text(
         "История успешно очищена.",
         reply_markup=_restart_keyboard(),
@@ -251,28 +288,46 @@ async def _next_or_predict(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         for key, value in context.user_data["answers"].items()
         if value is not None
     }
+    request_url = _predict_url()
     logger.info(
-        "Sending prediction payload user_id=%s payload=%s",
+        "Sending prediction request user_id=%s url=%s payload=%s",
         update.effective_user.id if update.effective_user else None,
+        request_url,
         payload,
     )
     await update.message.reply_text("Считаю прогноз...", reply_markup=ReplyKeyboardRemove())
 
+    response = None
     try:
-        response = requests.post(f"{API_URL}/predict", json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
-        logger.info("API response status=%s body=%s", response.status_code, response.text)
+        response = requests.post(request_url, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+        _log_api_response(response)
         response.raise_for_status()
     except requests.HTTPError as exc:
-        logger.exception("API returned an error for payload=%s", payload)
+        _log_exception(
+            "API returned HTTP error",
+            exc,
+            url=request_url,
+            payload=payload,
+            status_code=response.status_code if response is not None else None,
+            response_text=response.text if response is not None else None,
+        )
         message = "Проверьте введённые данные и попробуйте снова."
         try:
-            detail = response.json().get("detail")
+            detail = response.json().get("detail") if response is not None else None
             if isinstance(detail, dict) and detail.get("code") == "model_unavailable":
                 message = "Не удалось загрузить модель прогнозирования."
-            elif response.status_code >= 500:
+            elif response is not None and response.status_code >= 500:
                 message = "Не удалось получить прогноз. Попробуйте позже."
-        except requests.JSONDecodeError:
-            if response.status_code >= 500:
+        except ValueError as parse_exc:
+            _log_exception(
+                "Failed to parse API error response",
+                parse_exc,
+                url=request_url,
+                payload=payload,
+                status_code=response.status_code if response is not None else None,
+                response_text=response.text if response is not None else None,
+            )
+            if response is not None and response.status_code >= 500:
                 message = "Не удалось получить прогноз. Попробуйте позже."
 
         await update.message.reply_text(
@@ -282,15 +337,29 @@ async def _next_or_predict(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         context.user_data.clear()
         return ConversationHandler.END
     except requests.RequestException as exc:
-        logger.exception("Prediction API is unavailable")
+        _log_exception(
+            "Prediction API request failed",
+            exc,
+            url=request_url,
+            payload=payload,
+            response_text=response.text if response is not None else None,
+            status_code=response.status_code if response is not None else None,
+        )
         await update.message.reply_text(
             "Не удалось получить прогноз. Попробуйте позже.",
             reply_markup=_restart_keyboard(),
         )
         context.user_data.clear()
         return ConversationHandler.END
-    except Exception:
-        logger.exception("Unexpected Telegram bot error while requesting prediction")
+    except Exception as exc:
+        _log_exception(
+            "Unexpected Telegram bot error while requesting prediction",
+            exc,
+            url=request_url,
+            payload=payload,
+            response_text=response.text if response is not None else None,
+            status_code=response.status_code if response is not None else None,
+        )
         await update.message.reply_text(
             "Не удалось получить прогноз. Попробуйте позже.",
             reply_markup=_restart_keyboard(),
@@ -302,8 +371,15 @@ async def _next_or_predict(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         result = response.json()
         price = result["predicted_price_rounded"]
         currency = result.get("currency", "KZT")
-    except (ValueError, KeyError, TypeError):
-        logger.exception("Invalid API response format: %s", response.text)
+    except (ValueError, KeyError, TypeError) as exc:
+        _log_exception(
+            "Invalid API response format",
+            exc,
+            url=request_url,
+            payload=payload,
+            status_code=response.status_code,
+            response_text=response.text,
+        )
         await update.message.reply_text(
             "Не удалось получить прогноз. Попробуйте позже.",
             reply_markup=_restart_keyboard(),
@@ -337,6 +413,8 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 def main() -> None:
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set in .env")
+
+    logger.info("Bot configured with API_URL=%s predict_url=%s", API_URL, _predict_url())
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     conversation = ConversationHandler(
